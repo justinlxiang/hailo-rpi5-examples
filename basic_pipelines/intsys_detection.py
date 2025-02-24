@@ -33,13 +33,13 @@ class user_app_callback_class(app_callback_class):
 # User-defined callback function
 # -----------------------------------------------------------------------------------------------
 
-async def send_to_ground_station(frame):
+def send_to_ground_station(frame):
     # Convert frame to base64 encoded image with bounding boxes
     _, img_encoded = cv2.imencode('.jpg', frame)
     img_base64 = base64.b64encode(img_encoded).decode('utf-8')
     
     # Send data to ground server
-    server_url = "http://10.49.1.81:8888/detection-frame"
+    server_url = "http://10.49.2.77:8888/detection-frame"
     try:
         response = requests.post(
             server_url,
@@ -71,6 +71,7 @@ def app_callback(pad, info, user_data):
 
     # If the user_data.use_frame is set to True, we can get the video frame from the buffer
     frame = None
+    print(user_data.use_frame, format, width, height)
     if user_data.use_frame and format is not None and width is not None and height is not None:
         # Get video frame
         frame = get_numpy_from_buffer(buffer, format, width, height)
@@ -93,6 +94,27 @@ def app_callback(pad, info, user_data):
                 track_id = track[0].get_id()
             string_to_print += (f"Detection: ID: {track_id} Label: {label} Confidence: {confidence:.2f}\n")
             detection_count += 1
+            
+            # Draw bounding box if we have a frame
+            if frame is not None:
+                # Get bbox coordinates (normalized)
+                x1_norm = bbox.xmin()
+                y1_norm = bbox.ymin() 
+                x2_norm = bbox.xmax()
+                y2_norm = bbox.ymax()
+                
+                # Convert to pixel coordinates
+                height, width = frame.shape[:2]
+                x1 = int(x1_norm * width)
+                y1 = int(y1_norm * height)
+                x2 = int(x2_norm * width)
+                y2 = int(y2_norm * height)
+                
+                # Draw rectangle and label
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                label_text = f"{label} {confidence:.2f}"
+                cv2.putText(frame, label_text, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
     if user_data.use_frame:
         # Note: using imshow will not work here, as the callback function is not running in the main thread
         # Let's print the detection count to the frame
@@ -104,8 +126,10 @@ def app_callback(pad, info, user_data):
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         user_data.set_frame(frame)
         
-        # Send the frame to the ground station
-        asyncio.create_task(send_to_ground_station(frame))
+    # Send the frame to the ground station
+    if frame is not None:
+        frame = frame.copy()
+        send_to_ground_station(frame)
 
     print(string_to_print)
     return Gst.PadProbeReturn.OK
@@ -113,5 +137,6 @@ def app_callback(pad, info, user_data):
 if __name__ == "__main__":
     # Create an instance of the user app callback class
     user_data = user_app_callback_class()
+
     app = GStreamerDetectionApp(app_callback, user_data)
     app.run()
