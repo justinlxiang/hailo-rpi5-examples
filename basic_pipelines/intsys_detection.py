@@ -9,6 +9,10 @@ import base64
 import requests
 import time
 import asyncio
+import threading
+from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
+from av import VideoFrame
+import fractions
 
 from hailo_apps_infra.hailo_rpi_common import (
     get_caps_from_pad,
@@ -25,34 +29,98 @@ class user_app_callback_class(app_callback_class):
     def __init__(self):
         super().__init__()
         self.new_variable = 42  # New variable example
+        self.webrtc_connected = False
+        self.video_track = None
 
     def new_function(self):  # New function example
         return "The meaning of life is: "
+    
+    def set_video_track(self, track):
+        self.video_track = track
+        self.webrtc_connected = True
+
+# Custom VideoStreamTrack for WebRTC
+class DetectionVideoStreamTrack(VideoStreamTrack):
+    kind = "video"
+    
+    def __init__(self):
+        super().__init__()
+        self.frame = None
+        self.pts = 0
+        self.time_base = fractions.Fraction(1, 90000)
+        # Default black frame
+        self.frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    
+    def push_frame(self, frame):
+        self.frame = frame
+    
+    async def recv(self):
+        if self.frame is None:
+            # Return black frame if no frame is available
+            img = np.zeros((480, 640, 3), dtype=np.uint8)
+        else:
+            img = self.frame
+            
+        # Convert to VideoFrame
+        video_frame = VideoFrame.from_ndarray(img, format="bgr24")
+        video_frame.pts = self.pts
+        video_frame.time_base = self.time_base
+        self.pts += 3000  # 30fps
+        
+        return video_frame
+
+# -----------------------------------------------------------------------------------------------
+# WebRTC Connection Management
+# -----------------------------------------------------------------------------------------------
+
+# Server configuration
+SERVER_URL = "http://10.48.61.73:8888"
+
+# Function to establish WebRTC connection with server
+async def setup_webrtc_connection(user_data):
+    # Create peer connection
+    pc = RTCPeerConnection()
+    
+    # Create video track
+    video_track = DetectionVideoStreamTrack()
+    user_data.set_video_track(video_track)
+    
+    # Add track to peer connection
+    pc.addTrack(video_track)
+    
+    # Create offer
+    offer = await pc.createOffer()
+    await pc.setLocalDescription(offer)
+    
+    # Send offer to server
+    response = requests.post(
+        f"{SERVER_URL}/raspberry-pi/offer",
+        json={"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+    )
+    
+    if response.status_code != 200:
+        print(f"Failed to send offer: {response.status_code}")
+        return False
+    
+    # Get answer from server
+    answer = response.json()
+    
+    # Set remote description
+    await pc.setRemoteDescription(RTCSessionDescription(sdp=answer["sdp"], type=answer["type"]))
+    
+    print("WebRTC connection established!")
+    return True
+
+# Function to run the asyncio event loop
+def run_asyncio_loop(user_data):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(setup_webrtc_connection(user_data))
+    loop.run_forever()
 
 # -----------------------------------------------------------------------------------------------
 # User-defined callback function
 # -----------------------------------------------------------------------------------------------
-
-def send_to_ground_station(frame):
-    # Convert frame to base64 encoded image with bounding boxes
-    _, img_encoded = cv2.imencode('.jpg', frame)
-    img_base64 = base64.b64encode(img_encoded).decode('utf-8')
-    
-    # Send data to ground server
-    server_url = "http://10.49.2.77:8888/detection-frame"
-    try:
-        response = requests.post(
-            server_url,
-            json={
-                "timestamp": int(time.time()),
-                "frame": img_base64
-            }
-        )
-        response.raise_for_status()
-        print("Successfully sent frame to ground server")
-    except Exception as e:
-        print(f"Error sending frame to ground server: {e}")
-    pass
 
 # This is the callback function that will be called when data is available from the pipeline
 def app_callback(pad, info, user_data):
@@ -115,21 +183,18 @@ def app_callback(pad, info, user_data):
                 label_text = f"{label} {confidence:.2f}"
                 cv2.putText(frame, label_text, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-    if user_data.use_frame:
-        # Note: using imshow will not work here, as the callback function is not running in the main thread
-        # Let's print the detection count to the frame
+    if user_data.use_frame and frame is not None:
+        # Add detection count to the frame
         cv2.putText(frame, f"Detections: {detection_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         # Example of how to use the new_variable and new_function from the user_data
-        # Let's print the new_variable and the result of the new_function to the frame
         cv2.putText(frame, f"{user_data.new_function()} {user_data.new_variable}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         # Convert the frame to BGR
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         user_data.set_frame(frame)
         
-    # Send the frame to the ground station
-    if frame is not None:
-        frame = frame.copy()
-        send_to_ground_station(frame)
+        # Send the frame via WebRTC if connected
+        if user_data.webrtc_connected and user_data.video_track:
+            user_data.video_track.push_frame(frame)
 
     print(string_to_print)
     return Gst.PadProbeReturn.OK
@@ -137,6 +202,13 @@ def app_callback(pad, info, user_data):
 if __name__ == "__main__":
     # Create an instance of the user app callback class
     user_data = user_app_callback_class()
+    user_data.use_frame = True  # Make sure we get frames
 
+    # Start WebRTC connection in a separate thread
+    webrtc_thread = threading.Thread(target=run_asyncio_loop, args=(user_data,))
+    webrtc_thread.daemon = True
+    webrtc_thread.start()
+
+    # Run the detection app
     app = GStreamerDetectionApp(app_callback, user_data)
     app.run()
